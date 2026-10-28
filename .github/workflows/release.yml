@@ -1,6 +1,9 @@
 name: Release
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_call:
     inputs:
       tag_name:
@@ -32,13 +35,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: refs/tags/${{ inputs.tag_name }}
+          ref: refs/tags/${{ inputs.tag_name || github.ref_name }}
 
       - name: Extract version from tag
         id: metadata
         shell: bash
         env:
-          RELEASE_TAG: ${{ inputs.tag_name }}
+          RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
         run: |
           version="${RELEASE_TAG#v}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
@@ -74,7 +77,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: refs/tags/${{ inputs.tag_name }}
+          ref: refs/tags/${{ inputs.tag_name || github.ref_name }}
 
       - name: Setup vx (installs Rust from vx.toml)
         uses: loonghao/vx@v0.9.26
@@ -160,7 +163,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ inputs.tag_name }}
+          RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
           REPOSITORY: ${{ github.repository }}
         run: |
           release_url="https://github.com/${REPOSITORY}/releases/tag/${RELEASE_TAG}"
