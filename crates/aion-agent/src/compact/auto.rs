@@ -31,9 +31,11 @@ pub const BOUNDARY_PREFIX: &str = "[Conversation compacted]";
 #[derive(Debug, Clone)]
 pub struct CompactResult {
     /// Post-compact messages that replace the original conversation.
-    /// Contains a boundary marker and a summary message.
+    /// Contains a boundary marker, a summary message, and optionally a
+    /// verbatim tail of the most recent turns.
     pub messages: Vec<Message>,
-    /// How many original messages were summarized.
+    /// How many original messages were summarized (the verbatim tail is
+    /// excluded from this count).
     pub messages_summarized: usize,
     /// Best-known context token count before compaction.
     pub pre_compact_tokens: u64,
@@ -100,7 +102,6 @@ pub async fn autocompact(
     }
 
     let pre_compact_tokens = state.last_input_tokens;
-    let messages_summarized = messages.len();
 
     // Build messages for the compact LLM call: conversation + summary prompt.
     // The conversation is trimmed up front: this request re-sends the whole
@@ -175,6 +176,18 @@ pub async fn autocompact(
     // Format and build post-compact messages
     let formatted = format_compact_summary(&summary_text);
     let summary_content = build_summary_content(&formatted, true);
+    let summary_msg = Message::new(Role::User, vec![ContentBlock::Text { text: summary_content }]);
+
+    // Keep the most recent turns verbatim after the summary so fine-grained
+    // recent context is not lost to summarization. The tail is bounded by the
+    // post-compact input budget and `keep_recent_tokens`.
+    let post_budget = (config.context_window as u64).saturating_sub(config.output_reserve as u64);
+    let fixed_tokens = estimate_messages_tokens(std::slice::from_ref(&summary_msg))
+        .saturating_add(COMPACT_PROMPT_RESERVE);
+    let tail_budget = (config.keep_recent_tokens as u64).min(post_budget.saturating_sub(fixed_tokens));
+    let tail_start = select_recent_tail(messages, tail_budget);
+    let tail = &messages[tail_start..];
+    let messages_summarized = messages.len().saturating_sub(tail.len());
 
     let metadata = CompactMetadata {
         trigger: CompactTrigger::Auto,
@@ -189,15 +202,63 @@ pub async fn autocompact(
 
     let boundary_msg = Message::new(Role::User, vec![ContentBlock::Text { text: boundary_text }]);
 
-    let summary_msg = Message::new(Role::User, vec![ContentBlock::Text { text: summary_content }]);
+    let mut post_messages = Vec::with_capacity(tail.len() + 2);
+    post_messages.push(boundary_msg);
+    post_messages.push(summary_msg);
+    post_messages.extend_from_slice(tail);
 
     state.record_success();
 
     Ok(CompactResult {
-        messages: vec![boundary_msg, summary_msg],
+        messages: post_messages,
         messages_summarized,
         pre_compact_tokens,
     })
+}
+
+/// Index of the first message kept verbatim as the post-compact tail.
+///
+/// Walks backwards from the newest message while the accumulated estimate fits
+/// `max_tokens`, then moves the cut forward to a genuine user turn so a
+/// tool-call / tool-result pair is never split across the compaction boundary.
+/// Returns `messages.len()` (empty tail) when no verbatim tail fits.
+fn select_recent_tail(messages: &[Message], max_tokens: u64) -> usize {
+    if max_tokens == 0 || messages.is_empty() {
+        return messages.len();
+    }
+
+    let mut used = 0_u64;
+    let mut start = messages.len();
+    while start > 0 {
+        let candidate = estimate_messages_tokens(std::slice::from_ref(&messages[start - 1]));
+        if used.saturating_add(candidate) > max_tokens {
+            break;
+        }
+        used = used.saturating_add(candidate);
+        start -= 1;
+    }
+
+    while start < messages.len() && !is_turn_start(&messages[start]) {
+        start += 1;
+    }
+    start
+}
+
+/// Whether a message starts a real user turn.
+///
+/// Tool results are stored in `Role::User` messages, so those are not turn
+/// boundaries: keeping them without their originating assistant `ToolUse` would
+/// produce an orphan tool result.
+fn is_turn_start(message: &Message) -> bool {
+    if message.role != Role::User {
+        return false;
+    }
+    for block in &message.content {
+        if matches!(block, ContentBlock::ToolResult { .. }) {
+            return false;
+        }
+    }
+    true
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -266,13 +327,17 @@ async fn collect_stream_text(mut rx: mpsc::Receiver<LlmEvent>) -> Result<(String
 const TRUNCATE_PLACEHOLDER: &str = "[earlier conversation truncated for compaction retry]";
 
 fn is_truncate_placeholder(message: &Message) -> bool {
-    message.role == Role::User
-        && message.content.iter().any(|block| {
-            matches!(
-                block,
-                ContentBlock::Text { text } if text == TRUNCATE_PLACEHOLDER
-            )
-        })
+    if message.role != Role::User {
+        return false;
+    }
+    for block in &message.content {
+        if let ContentBlock::Text { text } = block
+            && text.as_str() == TRUNCATE_PLACEHOLDER
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Truncate the oldest ~20% of messages for PTL retry.
