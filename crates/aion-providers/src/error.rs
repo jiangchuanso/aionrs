@@ -63,6 +63,68 @@ pub(crate) fn prompt_too_long(status: u16, message: &str) -> Option<ProviderErro
     None
 }
 
+/// Extract the model's context window (in tokens) from a provider error message.
+///
+/// Providers phrase window overflow differently, for example:
+/// - `This model's maximum context length is 8192 tokens.`
+/// - `Requested token count exceeds the model's maximum context length of 131077 tokens.`
+/// - `prompt is too long: 213000 tokens > 200000 maximum`
+///
+/// Returns `None` when no plausible limit can be read. Values outside a sane
+/// range are ignored so an unrelated number in the message cannot corrupt the
+/// window.
+pub fn parse_context_limit_hint(message: &str) -> Option<usize> {
+    let lower = message.to_ascii_lowercase();
+
+    const MARKERS: [&str; 8] = [
+        "maximum context length is",
+        "maximum context length of",
+        "max context length is",
+        "context length is",
+        "context length of",
+        "context window is",
+        "context window of",
+        "tokens >",
+    ];
+
+    for marker in MARKERS {
+        if let Some(position) = lower.find(marker) {
+            let rest = &lower[position + marker.len()..];
+            if let Some(limit) = first_plausible_number(rest) {
+                return Some(limit);
+            }
+        }
+    }
+    None
+}
+
+/// Return the first integer in `text` that could plausibly be a context window.
+fn first_plausible_number(text: &str) -> Option<usize> {
+    const MIN_PLAUSIBLE: usize = 256;
+    const MAX_PLAUSIBLE: usize = 10_000_000;
+
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < bytes.len() && (bytes[index].is_ascii_digit() || matches!(bytes[index], b'_' | b',')) {
+            index += 1;
+        }
+        let digits: String = text[start..index].chars().filter(char::is_ascii_digit).collect();
+        if let Ok(value) = digits.parse::<usize>()
+            && (MIN_PLAUSIBLE..=MAX_PLAUSIBLE).contains(&value)
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
 /// Map a provider JSON error payload to a `ProviderError`.
 ///
 /// Covers error bodies delivered with a successful HTTP status: whole-body

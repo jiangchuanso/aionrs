@@ -148,3 +148,33 @@ mod json_error_body_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod context_limit_hint_tests {
+    use super::*;
+
+    #[test]
+    fn parses_openai_style_message() {
+        let message =
+            "This model's maximum context length is 8192 tokens. However, your messages resulted in 10000 tokens.";
+        assert_eq!(parse_context_limit_hint(message), Some(8192));
+    }
+
+    #[test]
+    fn parses_vllm_style_message_with_separators() {
+        let message = "Requested token count exceeds the model's maximum context length of 131,077 tokens.";
+        assert_eq!(parse_context_limit_hint(message), Some(131_077));
+    }
+
+    #[test]
+    fn parses_anthropic_style_message() {
+        let message = "prompt is too long: 213000 tokens > 200000 maximum";
+        assert_eq!(parse_context_limit_hint(message), Some(200_000));
+    }
+
+    #[test]
+    fn ignores_messages_without_a_plausible_limit() {
+        assert_eq!(parse_context_limit_hint("invalid api key"), None);
+        assert_eq!(parse_context_limit_hint("context length is 12 tokens"), None);
+    }
+}
