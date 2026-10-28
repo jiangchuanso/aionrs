@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.12](https://github.com/jiangchuanso/aionrs/compare/v0.2.11...v0.2.12) (2026-10-28)
+
+
+### Features
+
+* **compact:** reactive compaction with adaptive window cap and context reservation ([d801237](https://github.com/jiangchuanso/aionrs/commit/d801237e29d5b519b8bba8e19e96abdda457c911))
+
 ## [0.2.11](https://github.com/iOfficeAI/aionrs/compare/v0.2.10...v0.2.11) (2026-08-13)
 
 
