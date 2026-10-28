@@ -12,6 +12,7 @@ use aion_types::llm::{LlmEvent, LlmRequest};
 use aion_types::message::{ContentBlock, Message, Role, TokenUsage};
 use tokio::sync::mpsc;
 
+use super::estimate::estimate_messages_tokens;
 use super::prompt::{
     COMPACT_MAX_OUTPUT_TOKENS, COMPACT_SYSTEM_PROMPT, build_compact_prompt, build_summary_content,
     format_compact_summary,
@@ -101,9 +102,17 @@ pub async fn autocompact(
     let pre_compact_tokens = state.last_input_tokens;
     let messages_summarized = messages.len();
 
-    // Build messages for the compact LLM call: conversation + summary prompt
-    let prompt = build_compact_prompt();
-    let mut conv_messages = messages.to_vec();
+    // Build messages for the compact LLM call: conversation + summary prompt.
+    // The conversation is trimmed up front: this request re-sends the whole
+    // history plus a fixed 20K completion budget, so a conversation that merely
+    // sits near the window produces a request the provider rejects. Trimming
+    // here is what makes compaction work against OpenAI-compatible servers,
+    // which answer a plain 400 instead of a recognizable prompt-too-long error.
+    let (mut conv_messages, trimmed) = fit_to_window(messages.to_vec(), config.context_window);
+    let mut prompt = build_compact_prompt();
+    if trimmed {
+        prompt.push_str(TRUNCATED_NOTICE);
+    }
     conv_messages.push(Message::new(Role::User, vec![ContentBlock::Text { text: prompt }]));
 
     let mut ptl_attempts = 0u32;
@@ -193,6 +202,47 @@ pub async fn autocompact(
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Appended to the summary prompt when the oldest messages had to be dropped to
+/// fit the request, so the summary states what it could not see.
+const TRUNCATED_NOTICE: &str = concat!(
+    "\n\nNOTE: the earliest messages were dropped to fit the model context window. ",
+    "Summarize what remains and say that earlier turns were omitted.",
+);
+
+/// Room reserved for the summary prompt text itself (tokens).
+const COMPACT_PROMPT_RESERVE: u64 = 1_500;
+
+/// Trim the oldest messages until the summary request fits the model window.
+///
+/// Returns the (possibly shortened) conversation plus whether anything was
+/// dropped. The budget is `context_window - fixed completion budget - prompt
+/// reserve`; the completion budget is not configurable in the engine, so it has
+/// to be subtracted here rather than left to the provider.
+fn fit_to_window(mut messages: Vec<Message>, context_window: usize) -> (Vec<Message>, bool) {
+    let budget = (context_window as u64)
+        .saturating_sub(COMPACT_MAX_OUTPUT_TOKENS as u64)
+        .saturating_sub(COMPACT_PROMPT_RESERVE);
+    let mut trimmed = false;
+    // `truncate_for_retry` always drops at least one message, so the loop
+    // terminates; the counter only guards against a future change that stops
+    // shrinking.
+    for _ in 0..256 {
+        if estimate_messages_tokens(&messages) <= budget {
+            break;
+        }
+        match truncate_for_retry(&messages) {
+            Some(next) => {
+                messages = next;
+                trimmed = true;
+            }
+            // A single message that already exceeds the budget: send it and let
+            // the provider decide rather than dropping the whole conversation.
+            None => break,
+        }
+    }
+    (messages, trimmed)
+}
+
 /// Collect all text from a streaming LLM response.
 async fn collect_stream_text(mut rx: mpsc::Receiver<LlmEvent>) -> Result<(String, TokenUsage), CompactError> {
     let mut text = String::new();
@@ -211,6 +261,20 @@ async fn collect_stream_text(mut rx: mpsc::Receiver<LlmEvent>) -> Result<(String
     Err(CompactError::EmptyResponse)
 }
 
+/// Message prepended when the oldest messages are dropped, so the model knows
+/// earlier turns were omitted.
+const TRUNCATE_PLACEHOLDER: &str = "[earlier conversation truncated for compaction retry]";
+
+fn is_truncate_placeholder(message: &Message) -> bool {
+    message.role == Role::User
+        && message.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::Text { text } if text == TRUNCATE_PLACEHOLDER
+            )
+        })
+}
+
 /// Truncate the oldest ~20% of messages for PTL retry.
 ///
 /// Returns `None` if there are too few messages to truncate meaningfully.
@@ -219,22 +283,34 @@ fn truncate_for_retry(messages: &[Message]) -> Option<Vec<Message>> {
         return None;
     }
 
-    let drop_count = (messages.len() / 5).max(1);
-    if drop_count >= messages.len() {
+    // Keep any leading placeholder out of the droppable set. Otherwise an
+    // automated trimmer (e.g. `fit_to_window`) that drops a single message per
+    // pass can delete only the placeholder and re-insert it on the next pass,
+    // looping forever without ever removing real content.
+    let (prefix, rest) = match messages.first() {
+        Some(first) if is_truncate_placeholder(first) => (Some(first), &messages[1..]),
+        _ => (None, messages),
+    };
+
+    let drop_count = (rest.len() / 5).max(1);
+    if drop_count >= rest.len() {
         return None;
     }
 
-    let remaining = &messages[drop_count..];
+    let remaining = &rest[drop_count..];
     let mut result = Vec::with_capacity(remaining.len() + 1);
 
-    // Ensure the first message is User role for API compatibility
-    if remaining.first().map(|m| m.role) != Some(Role::User) {
-        result.push(Message::new(
+    // Ensure the first message is User role for API compatibility, reusing the
+    // existing placeholder instead of stacking a second one.
+    match prefix {
+        Some(placeholder) => result.push(placeholder.clone()),
+        None if remaining.first().map(|m| m.role) != Some(Role::User) => result.push(Message::new(
             Role::User,
             vec![ContentBlock::Text {
-                text: "[earlier conversation truncated for compaction retry]".to_string(),
+                text: TRUNCATE_PLACEHOLDER.to_string(),
             }],
-        ));
+        )),
+        _ => {}
     }
 
     result.extend_from_slice(remaining);

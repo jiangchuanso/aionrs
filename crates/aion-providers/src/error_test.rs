@@ -26,6 +26,55 @@ mod retryable_tests {
 }
 
 #[cfg(test)]
+mod prompt_too_long_tests {
+    use super::*;
+
+    /// The exact body sglang returns for an oversized request.
+    const SGLANG_BODY: &str = r#"{"object":"error","message":"Requested token count exceeds the model's maximum context length of 131077 tokens. You requested a total of 148969 tokens: 128969 tokens from the input messages and 20000 tokens for the completion. Please reduce the number of tokens in the input messages or the completion to fit within the limit.","type":"BadRequestError","param":null,"code":400}"#;
+
+    #[test]
+    fn openai_compatible_400_becomes_prompt_too_long() {
+        let body: serde_json::Value = serde_json::from_str(SGLANG_BODY).expect("valid JSON");
+
+        let error =
+            provider_error_from_json_body(&body, SGLANG_BODY.as_bytes()).expect("status 400 should map to an error");
+        assert!(
+            matches!(error, ProviderError::PromptTooLong(_)),
+            "sglang's oversized-prompt 400 must be recognized: {error:?}"
+        );
+    }
+
+    #[test]
+    fn anthropic_style_message_is_recognized() {
+        let classified = prompt_too_long(400, "prompt is too long: 213589 tokens > 200000 maximum");
+        assert!(matches!(classified, Some(ProviderError::PromptTooLong(_))));
+    }
+
+    #[test]
+    fn payload_too_large_status_is_recognized() {
+        let classified = prompt_too_long(413, "request body too many tokens");
+        assert!(matches!(classified, Some(ProviderError::PromptTooLong(_))));
+    }
+
+    #[test]
+    fn ordinary_400_stays_an_api_error() {
+        for message in ["invalid request: missing model", "tool schema rejected"] {
+            assert!(
+                prompt_too_long(400, message).is_none(),
+                "`{message}` is not an overflow"
+            );
+        }
+    }
+
+    #[test]
+    fn window_overflow_text_with_a_500_status_is_not_reclassified() {
+        // A 5xx carrying this wording is a gateway failure; reclassifying it
+        // would make the turn compact instead of retrying.
+        assert!(prompt_too_long(502, "maximum context length").is_none());
+    }
+}
+
+#[cfg(test)]
 mod json_error_body_tests {
     use super::*;
 

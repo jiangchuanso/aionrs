@@ -26,6 +26,43 @@ impl ProviderError {
     }
 }
 
+/// HTTP statuses providers use to reject an oversized request. OpenAI-compatible
+/// servers (sglang, vLLM, llama.cpp) answer 400; some gateways use 413 or 422.
+const PROMPT_TOO_LONG_STATUSES: [u16; 3] = [400, 413, 422];
+
+/// Case-insensitive substrings that identify a window-overflow rejection. Kept
+/// narrow on purpose: these messages must not swallow ordinary 400s such as
+/// "invalid request" or a malformed tool schema.
+const PROMPT_TOO_LONG_MARKERS: [&str; 9] = [
+    "maximum context length",
+    "context length exceeded",
+    "context window exceeds",
+    "exceeds the model's maximum context",
+    "prompt is too long",
+    "input is too long",
+    "reduce the number of tokens",
+    "requested token count exceeds",
+    "too many tokens",
+];
+
+/// Classify an HTTP error as a context-window overflow.
+///
+/// `PromptTooLong` is what lets the engine recover — autocompact trims the
+/// conversation and retries, and the main turn can compact instead of failing —
+/// so an OpenAI-compatible "your prompt does not fit" 400 must not stay a plain
+/// `Api { status: 400 }`: that variant is neither retryable nor recognizable,
+/// and autocompact surfaced it verbatim as `Autocompact failed`.
+pub(crate) fn prompt_too_long(status: u16, message: &str) -> Option<ProviderError> {
+    if !PROMPT_TOO_LONG_STATUSES.contains(&status) {
+        return None;
+    }
+    let lower = message.to_ascii_lowercase();
+    if PROMPT_TOO_LONG_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return Some(ProviderError::PromptTooLong(message.trim().to_owned()));
+    }
+    None
+}
+
 /// Map a provider JSON error payload to a `ProviderError`.
 ///
 /// Covers error bodies delivered with a successful HTTP status: whole-body
@@ -61,7 +98,7 @@ pub(crate) fn provider_error_from_json_body(body: &Value, body_bytes: &[u8]) -> 
             retry_after_ms: 5000,
             body: (!body_bytes.is_empty()).then(|| String::from_utf8_lossy(body_bytes).into_owned()),
         }),
-        Some(status) => Some(ProviderError::Api { status, message }),
+        Some(status) => prompt_too_long(status, &message).or(Some(ProviderError::Api { status, message })),
         None if error_field.is_some() => Some(ProviderError::Parse(format!(
             "Provider returned a JSON error response without an HTTP status: {message}"
         ))),
