@@ -182,8 +182,8 @@ pub async fn autocompact(
     // recent context is not lost to summarization. The tail is bounded by the
     // post-compact input budget and `keep_recent_tokens`.
     let post_budget = (config.context_window as u64).saturating_sub(config.output_reserve as u64);
-    let fixed_tokens = estimate_messages_tokens(std::slice::from_ref(&summary_msg))
-        .saturating_add(COMPACT_PROMPT_RESERVE);
+    let fixed_tokens =
+        estimate_messages_tokens(std::slice::from_ref(&summary_msg)).saturating_add(COMPACT_PROMPT_RESERVE);
     let tail_budget = (config.keep_recent_tokens as u64).min(post_budget.saturating_sub(fixed_tokens));
     let tail_start = select_recent_tail(messages, tail_budget);
     let tail = &messages[tail_start..];

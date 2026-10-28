@@ -1267,7 +1267,8 @@ impl AgentEngine {
         let mut compact_messages = self.messages.clone();
         project_image_input(&mut compact_messages, self.compat.image_input(), &self.model);
         let pre_compact_tokens = self.compact_state.last_input_tokens;
-        self.output.emit_compact_started(trigger.as_str(), Some(pre_compact_tokens));
+        self.output
+            .emit_compact_started(trigger.as_str(), Some(pre_compact_tokens));
 
         let mut result = match autocompact(
             provider.as_ref(),

@@ -48,5 +48,6 @@ pub trait OutputSink: Send + Sync {
         _pre_compact_tokens: u64,
         _post_compact_tokens: u64,
         _messages_summarized: usize,
-    ) {}
+    ) {
+    }
 }
